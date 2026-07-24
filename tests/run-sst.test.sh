@@ -34,6 +34,7 @@ run_action() {
     PR_NUMBER="${PR_NUMBER-123}" \
     TEST_CALL_LOG="${temp_dir}/calls" \
     TEST_COUNTER_FILE="${temp_dir}/counter" \
+    TEST_STREAM_RELEASE_FILE="${temp_dir}/stream-release" \
     TEST_SCENARIO="$1" \
     bash "$script_under_test"
 }
@@ -58,6 +59,13 @@ case "${TEST_SCENARIO}:$1:$2" in
   deploy-failure:sst:deploy)
     echo "deploy failed" >&2
     exit 1
+    ;;
+  deploy-stream:sst:deploy)
+    echo "deploy started"
+    while [[ ! -e "$TEST_STREAM_RELEASE_FILE" ]]; do
+      sleep 0.01
+    done
+    echo "https://streamed.cloudfront.net"
     ;;
   deploy-failure:sst:remove | deploy-failure:sst:state)
     echo "Stages: dev"
@@ -143,15 +151,46 @@ test_deploy_success() {
 
 test_deploy_failure_rolls_back() {
   local temp_dir
+  local output_file
   temp_dir="$(make_temp_dir)"
+  output_file="${temp_dir}/output"
 
-  if INPUT_OPERATION=deploy run_action "$temp_dir" deploy-failure; then
+  if INPUT_OPERATION=deploy run_action "$temp_dir" deploy-failure >"$output_file" 2>&1; then
     fail "deploy failure unexpectedly succeeded"
   fi
 
   assert_contains "${temp_dir}/calls" "sst deploy --stage pr-123"
   assert_contains "${temp_dir}/calls" "sst remove --stage pr-123"
   assert_contains "${temp_dir}/calls" "sst state list"
+  [[ "$(grep -Fxc "deploy failed" "$output_file")" -eq 1 ]] ||
+    fail "deploy failure output was not streamed exactly once"
+}
+
+test_deploy_output_is_streamed() {
+  local action_pid
+  local output_file
+  local stream_observed="false"
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+  output_file="${temp_dir}/output"
+
+  INPUT_OPERATION=deploy run_action "$temp_dir" deploy-stream >"$output_file" 2>&1 &
+  action_pid=$!
+
+  for _ in {1..200}; do
+    if grep -Fq "deploy started" "$output_file"; then
+      stream_observed="true"
+      break
+    fi
+    sleep 0.01
+  done
+
+  touch "${temp_dir}/stream-release"
+  wait "$action_pid"
+
+  [[ "$stream_observed" == "true" ]] ||
+    fail "deploy output was not visible before deployment completed"
+  assert_contains "${temp_dir}/github-output" "url=https://streamed.cloudfront.net"
 }
 
 test_remove_retries() {
@@ -313,6 +352,7 @@ test_missing_pr_number_is_rejected() {
 
 test_deploy_success
 test_deploy_failure_rolls_back
+test_deploy_output_is_streamed
 test_remove_retries
 test_verification_retries
 test_auto_closed_event_removes

@@ -191,9 +191,22 @@ if [[ "$operation" == "remove" ]]; then
   exit 0
 fi
 
-deploy_output=""
-if ! deploy_output="$(npx sst deploy --stage "$stage" 2>&1)"; then
-  printf '%s\n' "$deploy_output" >&2
+deploy_log="$(mktemp)"
+cleanup_deploy_log() {
+  rm -f -- "$deploy_log"
+}
+trap cleanup_deploy_log EXIT
+
+set +e
+npx sst deploy --stage "$stage" 2>&1 | tee "$deploy_log"
+deploy_pipeline_status=("${PIPESTATUS[@]}")
+set -e
+
+readonly deploy_status="${deploy_pipeline_status[0]}"
+readonly tee_status="${deploy_pipeline_status[1]}"
+
+if ((deploy_status != 0)); then
+  error "SST deploy failed for ${stage}"
 
   if [[ "$cleanup_on_deploy_failure" == "true" ]]; then
     echo "Deploy failed; removing partially created resources for ${stage}"
@@ -205,9 +218,11 @@ if ! deploy_output="$(npx sst deploy --stage "$stage" 2>&1)"; then
   exit 1
 fi
 
-printf '%s\n' "$deploy_output"
+if ((tee_status != 0)); then
+  echo "::warning::SST deploy succeeded, but its output could not be captured completely"
+fi
 
-url="$(grep -oE 'https://[a-z0-9]+\.cloudfront\.net' <<<"$deploy_output" | head -1 || true)"
+url="$(grep -oE 'https://[a-z0-9]+\.cloudfront\.net' "$deploy_log" | head -1 || true)"
 echo "url=${url}" >>"$GITHUB_OUTPUT"
 
 if [[ -z "$url" ]]; then
