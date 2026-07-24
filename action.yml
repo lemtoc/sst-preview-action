@@ -10,51 +10,76 @@ inputs:
     description: "Directory containing sst.config"
     required: false
     default: "."
+  operation:
+    description: "Operation to run: auto, deploy, or remove"
+    required: false
+    default: "auto"
   comment-enabled:
     description: "Whether to post PR comment (ignored for remove action)"
     required: false
     default: "true"
+  cleanup-on-deploy-failure:
+    description: "Remove partially created resources when deploy fails"
+    required: false
+    default: "true"
+  remove-max-attempts:
+    description: "Maximum number of remove attempts"
+    required: false
+    default: "3"
+  remove-retry-delay-seconds:
+    description: "Delay between remove attempts in seconds"
+    required: false
+    default: "30"
+  verify-removal:
+    description: "Verify removal using SST state: auto, true, or false"
+    required: false
+    default: "auto"
 
 outputs:
   url:
     description: "Deployed CloudFront URL"
     value: ${{ steps.sst.outputs.url }}
+  operation:
+    description: "Resolved operation"
+    value: ${{ steps.sst.outputs.operation }}
+  stage:
+    description: "SST stage used by the action"
+    value: ${{ steps.sst.outputs.stage }}
 
 runs:
   using: composite
   steps:
     - name: Remove pre-installed Pulumi
+      if: runner.environment == 'github-hosted'
       shell: bash
-      run: rm -rf /usr/local/bin/pulumi*
-
-    - name: Get short commit sha
-      id: meta
-      shell: bash
-      run: |
-        SHA="${{ github.event.pull_request.head.sha }}"
-        echo "short_sha=${SHA::7}" >> "$GITHUB_OUTPUT"
+      run: rm -f /usr/local/bin/pulumi*
 
     - name: Run SST
       id: sst
       shell: bash
       working-directory: ${{ inputs.working-directory }}
-      run: |
-        if [ "${{ github.event.action }}" = "closed" ]; then
-          npx sst remove --stage pr-${{ github.event.pull_request.number }}
-        else
-          OUTPUT=$(npx sst deploy --stage pr-${{ github.event.pull_request.number }} 2>&1) || {
-            echo "$OUTPUT"
-            exit 1
-          }
-          echo "$OUTPUT"
+      env:
+        INPUT_CLEANUP_ON_DEPLOY_FAILURE: ${{ inputs.cleanup-on-deploy-failure }}
+        INPUT_OPERATION: ${{ inputs.operation }}
+        INPUT_REMOVE_MAX_ATTEMPTS: ${{ inputs.remove-max-attempts }}
+        INPUT_REMOVE_RETRY_DELAY_SECONDS: ${{ inputs.remove-retry-delay-seconds }}
+        INPUT_VERIFY_REMOVAL: ${{ inputs.verify-removal }}
+        PR_EVENT_ACTION: ${{ github.event.action }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: '"${{ github.action_path }}/scripts/run-sst.sh"'
 
-          URL=$(echo "$OUTPUT" | grep -oE 'https://[a-z0-9]+\.cloudfront\.net' | head -1)
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-        fi
+    - name: Get short commit sha
+      if: steps.sst.outputs.operation == 'deploy' && inputs.comment-enabled == 'true' && github.event_name == 'pull_request'
+      id: meta
+      shell: bash
+      env:
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: echo "short_sha=${HEAD_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
     - name: Comment on PR
-      if: github.event.action != 'closed' && inputs.comment-enabled == 'true' && github.event_name == 'pull_request'
-      uses: marocchino/sticky-pull-request-comment@v2
+      if: steps.sst.outputs.operation == 'deploy' && steps.sst.outputs.url != '' && inputs.comment-enabled == 'true' && github.event_name == 'pull_request'
+      continue-on-error: true
+      uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2.9.4
       with:
         message: |
           **Preview Deployed to AWS via [SST](https://www.sst.dev/)**
