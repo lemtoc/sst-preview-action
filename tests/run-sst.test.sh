@@ -29,14 +29,16 @@ run_action() {
     INPUT_PR_NUMBER="${INPUT_PR_NUMBER-}" \
     INPUT_REMOVE_MAX_ATTEMPTS="${INPUT_REMOVE_MAX_ATTEMPTS:-3}" \
     INPUT_REMOVE_RETRY_DELAY_SECONDS="0" \
+    INPUT_URL_OUTPUT_KEY="${INPUT_URL_OUTPUT_KEY-url}" \
     INPUT_VERIFY_REMOVAL="${INPUT_VERIFY_REMOVAL:-auto}" \
     PR_EVENT_ACTION="${PR_EVENT_ACTION:-opened}" \
     PR_NUMBER="${PR_NUMBER-123}" \
     TEST_CALL_LOG="${temp_dir}/calls" \
     TEST_COUNTER_FILE="${temp_dir}/counter" \
+    TEST_OUTPUTS_JSON="${TEST_OUTPUTS_JSON-}" \
     TEST_STREAM_RELEASE_FILE="${temp_dir}/stream-release" \
     TEST_SCENARIO="$1" \
-    bash "$script_under_test"
+    bash -c 'cd "$1" && exec bash "$2"' _ "$temp_dir" "$script_under_test"
 }
 
 make_temp_dir() {
@@ -66,6 +68,14 @@ case "${TEST_SCENARIO}:$1:$2" in
       sleep 0.01
     done
     echo "https://streamed.cloudfront.net"
+    ;;
+  deploy-named-output:sst:deploy)
+    mkdir -p .sst
+    printf '%s' "$TEST_OUTPUTS_JSON" >.sst/outputs.json
+    echo "https://legacy.cloudfront.net"
+    ;;
+  deploy-no-url:sst:deploy)
+    echo "✓ Complete"
     ;;
   deploy-failure:sst:remove | deploy-failure:sst:state)
     echo "Stages: dev"
@@ -191,6 +201,79 @@ test_deploy_output_is_streamed() {
   [[ "$stream_observed" == "true" ]] ||
     fail "deploy output was not visible before deployment completed"
   assert_contains "${temp_dir}/github-output" "url=https://streamed.cloudfront.net"
+}
+
+test_named_output_url_is_preferred() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=deploy \
+    TEST_OUTPUTS_JSON='{"url":"https://preview.example.com"}' \
+    run_action "$temp_dir" deploy-named-output
+
+  assert_contains "${temp_dir}/github-output" "url=https://preview.example.com"
+}
+
+test_custom_named_output_key_is_supported() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=deploy \
+    INPUT_URL_OUTPUT_KEY=previewUrl \
+    TEST_OUTPUTS_JSON='{"previewUrl":"https://custom.example.com"}' \
+    run_action "$temp_dir" deploy-named-output
+
+  assert_contains "${temp_dir}/github-output" "url=https://custom.example.com"
+}
+
+test_missing_named_output_falls_back_to_deploy_log() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=deploy \
+    INPUT_URL_OUTPUT_KEY=url \
+    TEST_OUTPUTS_JSON='{"apiUrl":"https://api.example.com"}' \
+    run_action "$temp_dir" deploy-named-output
+
+  assert_contains "${temp_dir}/github-output" "url=https://legacy.cloudfront.net"
+}
+
+test_invalid_named_output_cannot_inject_action_outputs() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=deploy \
+    INPUT_URL_OUTPUT_KEY=url \
+    TEST_OUTPUTS_JSON='{"url":"https://preview.example.com\nunsafe=true"}' \
+    run_action "$temp_dir" deploy-named-output
+
+  assert_contains "${temp_dir}/github-output" "url=https://legacy.cloudfront.net"
+  [[ "$(wc -l <"${temp_dir}/github-output")" -eq 3 ]] ||
+    fail "invalid named output injected an additional action output"
+}
+
+test_malformed_outputs_file_falls_back_to_deploy_log() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=deploy \
+    INPUT_URL_OUTPUT_KEY=url \
+    TEST_OUTPUTS_JSON='not-json' \
+    run_action "$temp_dir" deploy-named-output
+
+  assert_contains "${temp_dir}/github-output" "url=https://legacy.cloudfront.net"
+}
+
+test_missing_preview_url_emits_empty_output() {
+  local output_file
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+  output_file="${temp_dir}/output"
+
+  INPUT_OPERATION=deploy run_action "$temp_dir" deploy-no-url >"$output_file" 2>&1
+
+  assert_contains "${temp_dir}/github-output" "url="
+  assert_contains "$output_file" "Deploy succeeded, but no preview URL was found"
 }
 
 test_remove_retries() {
@@ -353,6 +436,12 @@ test_missing_pr_number_is_rejected() {
 test_deploy_success
 test_deploy_failure_rolls_back
 test_deploy_output_is_streamed
+test_named_output_url_is_preferred
+test_custom_named_output_key_is_supported
+test_missing_named_output_falls_back_to_deploy_log
+test_invalid_named_output_cannot_inject_action_outputs
+test_malformed_outputs_file_falls_back_to_deploy_log
+test_missing_preview_url_emits_empty_output
 test_remove_retries
 test_verification_retries
 test_auto_closed_event_removes

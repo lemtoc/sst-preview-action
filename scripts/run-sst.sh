@@ -7,9 +7,11 @@ readonly input_pr_number="${INPUT_PR_NUMBER:-}"
 readonly cleanup_on_deploy_failure="${INPUT_CLEANUP_ON_DEPLOY_FAILURE:-true}"
 readonly remove_max_attempts="${INPUT_REMOVE_MAX_ATTEMPTS:-3}"
 readonly remove_retry_delay_seconds="${INPUT_REMOVE_RETRY_DELAY_SECONDS:-30}"
+readonly url_output_key="${INPUT_URL_OUTPUT_KEY-url}"
 readonly verify_removal="${INPUT_VERIFY_REMOVAL:-auto}"
 readonly event_action="${PR_EVENT_ACTION:-}"
 readonly event_pr_number="${PR_NUMBER:-}"
+readonly script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 error() {
   echo "::error::$*" >&2
@@ -222,9 +224,21 @@ if ((tee_status != 0)); then
   echo "::warning::SST deploy succeeded, but its output could not be captured completely"
 fi
 
-url="$(grep -oE 'https://[a-z0-9]+\.cloudfront\.net' "$deploy_log" | head -1 || true)"
+url=""
+if [[ -n "$url_output_key" ]]; then
+  if ! url="$(
+    node "${script_directory}/read-sst-output.mjs" ".sst/outputs.json" "$url_output_key"
+  )"; then
+    url=""
+  fi
+fi
+
+if [[ -z "$url" ]]; then
+  url="$(grep -oE 'https://[a-z0-9]+\.cloudfront\.net' "$deploy_log" | head -1 || true)"
+fi
+
 echo "url=${url}" >>"$GITHUB_OUTPUT"
 
 if [[ -z "$url" ]]; then
-  echo "::warning::Deploy succeeded, but no CloudFront URL was found in SST output"
+  echo "::warning::Deploy succeeded, but no preview URL was found"
 fi

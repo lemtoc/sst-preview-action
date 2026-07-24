@@ -19,5 +19,6 @@ jobs:
       - name: Test action script
         shell: bash
         run: |
+          node --check scripts/read-sst-output.mjs
           bash -n scripts/run-sst.sh tests/run-sst.test.sh
           ./tests/run-sst.test.sh

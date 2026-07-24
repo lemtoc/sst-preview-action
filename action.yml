@@ -38,10 +38,14 @@ inputs:
     description: "Verify removal using SST state: auto, true, or false"
     required: false
     default: "auto"
+  url-output-key:
+    description: "Top-level SST output key containing the preview URL"
+    required: false
+    default: "url"
 
 outputs:
   url:
-    description: "Deployed CloudFront URL"
+    description: "Deployed preview URL"
     value: ${{ steps.sst.outputs.url }}
   operation:
     description: "Resolved operation"
@@ -68,6 +72,7 @@ runs:
         INPUT_PR_NUMBER: ${{ inputs.pr-number }}
         INPUT_REMOVE_MAX_ATTEMPTS: ${{ inputs.remove-max-attempts }}
         INPUT_REMOVE_RETRY_DELAY_SECONDS: ${{ inputs.remove-retry-delay-seconds }}
+        INPUT_URL_OUTPUT_KEY: ${{ inputs.url-output-key }}
         INPUT_VERIFY_REMOVAL: ${{ inputs.verify-removal }}
         PR_EVENT_ACTION: ${{ github.event.action }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
