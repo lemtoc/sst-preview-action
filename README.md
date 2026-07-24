@@ -12,7 +12,9 @@ Deploy and remove isolated SST preview environments for pull requests.
 - Streams SST deployment logs in real time
 - Reads a named SST output with a CloudFront URL fallback
 - Posts a sticky PR comment with the preview URL
-- Supports PR-number-only manual cleanup
+- Resolves manual deploy targets from the selected branch
+- Resolves manual cleanup targets from a trusted branch input
+- Supports PR-number disambiguation and deleted-branch cleanup
 - Reconciles orphaned preview stages on a schedule
 - Supports explicit `deploy`, `remove`, and `reconcile` operations, plus event-based auto detection
 
@@ -32,10 +34,22 @@ on:
     - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
-      pr_number:
-        description: Pull request number to clean up
+      operation:
+        description: Operation to run
         required: true
-        type: number
+        type: choice
+        options:
+          - deploy
+          - remove
+          - reconcile
+      pr_number:
+        description: Optional PR number for disambiguation or deleted branches
+        required: false
+        type: string
+      target_branch:
+        description: PR branch to remove
+        required: false
+        type: string
 
 concurrency:
   group: sst-preview
@@ -65,39 +79,63 @@ jobs:
             ${{
               github.event_name == 'pull_request' &&
               github.event.pull_request.head.sha ||
+              (
+                github.event_name == 'workflow_dispatch' &&
+                inputs.operation == 'deploy' &&
+                github.sha
+              ) ||
               github.event.repository.default_branch
             }}
           persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+      - run: npm ci
       - uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ap-northeast-1
       - uses: lemtoc/sst-preview-action@v1
         with:
-          operation: ${{ github.event_name == 'workflow_dispatch' && 'remove' || 'auto' }}
+          operation: ${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'auto' }}
           pr-number: ${{ inputs.pr_number || github.event.pull_request.number }}
+          target-branch: ${{ inputs.target_branch }}
           working-directory: path/to/sst/project
 ```
 
 For production workflows, pin third-party actions to a full commit SHA.
+Replace `npm ci` with the repository's package-manager install command.
 
 The workflow deploys pull-request head code only for same-repository
-`pull_request` events. `pull_request_target` close events and manual cleanup
-always run the trusted default branch, including when the pull request has merge
-conflicts. Do not change the checkout expression to execute pull-request code
-for these privileged events.
+`pull_request` events. A manual deploy checks out the branch selected in
+GitHub's standard **Run workflow** branch selector. For manual remove or
+reconcile, select the default branch in that selector. The action rejects
+cleanup dispatched from another ref. `pull_request_target` close events, manual
+remove, and reconciliation therefore run the trusted default branch, including
+when the pull request has merge conflicts. Do not change the checkout expression
+to execute pull-request code for cleanup or reconciliation.
 
 Scheduled runs reconcile SST state from the trusted default branch. The shared
 concurrency group prevents deployment, close cleanup, and reconciliation from
 overlapping. `queue: max` keeps up to 100 lifecycle runs waiting instead of
 replacing an older pending run.
 
-The manual cleanup input is a pull request number, not an SST stage name. The
-action validates it and always derives a `pr-{number}` stage, so it cannot be
-used to remove `dev`, `stg`, or `prod`.
+For a manual deploy without `pr-number`, the action looks for one open pull
+request whose head is the selected branch. No match is a successful no-op; more
+than one match is rejected. For a manual remove, `target-branch` identifies the
+pull request while the workflow remains on the default branch. Without
+`pr-number`, exactly one open or closed pull request must match that target
+branch. An open pull request's preview is removed with a warning and can be
+recreated by its next update. No match or multiple matches are rejected without
+removing anything.
+
+An explicit `pr-number` disambiguates multiple pull requests for the selected
+deploy branch or the cleanup `target-branch`. For immediate cleanup after a
+branch is deleted, select the default branch, leave `target-branch` empty, and
+provide its pull request number. The action verifies the pull request and always
+derives a `pr-{number}` stage, so it cannot be used to remove `dev`, `stg`, or
+`prod`. Manual reconciliation ignores both targeting inputs; select the default
+branch and choose `reconcile`.
 
 ## Reconciliation
 
@@ -178,7 +216,8 @@ stages.
 | ---------------------------- | -------- | ------- | ---------------------------------------------------------- |
 | `working-directory`          | false    | `.`     | Directory containing `sst.config`                          |
 | `operation`                  | false    | `auto`  | `auto`, `deploy`, `remove`, or `reconcile`                 |
-| `pr-number`                  | false    |         | PR number for manual workflows                             |
+| `pr-number`                  | false    |         | Manual PR disambiguation or default-branch cleanup target   |
+| `target-branch`              | false    |         | PR branch to resolve for trusted manual cleanup            |
 | `comment-enabled`            | false    | `true`  | Post a preview URL comment after deployment                |
 | `cleanup-on-deploy-failure`  | false    | `true`  | Remove the preview stage after a failed deployment         |
 | `remove-max-attempts`        | false    | `3`     | Maximum removal attempts                                   |
@@ -187,10 +226,12 @@ stages.
 | `url-output-key`             | false    | `url`   | Top-level SST output key containing the preview URL        |
 
 With `operation: auto`, scheduled events reconcile stages, closed pull-request
-events remove their stage, and other events deploy it. Manual cleanup must pass
-`operation: remove`, as shown above. Deploy and remove stages are always derived
-from `pr-number` or `github.event.pull_request.number`; arbitrary stage names are
-not accepted. When both values are present, they must match. Explicit
+events remove their stage, and other events deploy it. A manual workflow may
+select `deploy`, `remove`, or `reconcile`. Deploy and remove stages are always
+derived from `pr-number`, `github.event.pull_request.number`, or the pull
+request resolved from a manually selected deploy branch or cleanup
+`target-branch`; arbitrary stage names are not accepted. When both explicit and
+event pull request numbers are present, they must match. Explicit
 `operation: reconcile` is limited to `schedule` and `workflow_dispatch` events.
 
 `verify-removal: auto` verifies state when the installed SST version supports
@@ -203,7 +244,7 @@ Use `true` for strict verification with SST 4.13.0 or newer.
 | ----------- | ---------------------------------------------- |
 | `url`       | Deployed preview URL, when one is available    |
 | `operation` | Resolved `deploy`, `remove`, or `reconcile` operation |
-| `stage`     | The `pr-{number}` stage; empty for reconciliation     |
+| `stage`     | The `pr-{number}` stage; empty for reconciliation or a skipped deploy |
 
 ## Prerequisites
 
