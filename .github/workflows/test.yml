@@ -19,6 +19,9 @@ jobs:
       - name: Test action script
         shell: bash
         run: |
+          node --check scripts/plan-reconciliation.mjs
           node --check scripts/read-sst-output.mjs
-          bash -n scripts/run-sst.sh tests/run-sst.test.sh
+          node --test tests/action-metadata.test.mjs
+          node --test tests/plan-reconciliation.test.mjs
+          bash -n scripts/remove-reconciled-stages.sh scripts/run-sst.sh tests/run-sst.test.sh
           ./tests/run-sst.test.sh

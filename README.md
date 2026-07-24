@@ -13,7 +13,8 @@ Deploy and remove isolated SST preview environments for pull requests.
 - Reads a named SST output with a CloudFront URL fallback
 - Posts a sticky PR comment with the preview URL
 - Supports PR-number-only manual cleanup
-- Supports explicit `deploy` and `remove` operations, plus event-based auto detection
+- Reconciles orphaned preview stages on a schedule
+- Supports explicit `deploy`, `remove`, and `reconcile` operations, plus event-based auto detection
 
 ## Recommended usage
 
@@ -27,6 +28,8 @@ on:
     types: [opened, reopened, synchronize]
   pull_request_target:
     types: [closed]
+  schedule:
+    - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
       pr_number:
@@ -35,7 +38,8 @@ on:
         type: number
 
 concurrency:
-  group: preview-pr-${{ inputs.pr_number || github.event.pull_request.number }}
+  group: sst-preview
+  queue: max
   cancel-in-progress: false
 
 permissions:
@@ -86,9 +90,43 @@ always run the trusted default branch, including when the pull request has merge
 conflicts. Do not change the checkout expression to execute pull-request code
 for these privileged events.
 
+Scheduled runs reconcile SST state from the trusted default branch. The shared
+concurrency group prevents deployment, close cleanup, and reconciliation from
+overlapping. `queue: max` keeps up to 100 lifecycle runs waiting instead of
+replacing an older pending run.
+
 The manual cleanup input is a pull request number, not an SST stage name. The
 action validates it and always derives a `pr-{number}` stage, so it cannot be
 used to remove `dev`, `stg`, or `prod`.
+
+## Reconciliation
+
+Reconciliation is a safety net for a close-event workflow that failed or was
+canceled. It:
+
+1. Lists deployed SST stages and accepts only bare `pr-{number}` entries.
+2. Queries each matching pull request and completes the entire removal plan
+   before deleting anything.
+3. Keeps open and recently closed pull requests.
+4. Removes pull requests that have remained closed for at least one hour.
+5. Rechecks every eligible pull request immediately before writing the
+   token-free removal plan.
+
+The inventory command uses `pr-1` only as a read-only probe context for
+evaluating `sst.config`; it does not deploy or remove that stage. Reconciliation
+requires the app name returned by `app(input)` to stay the same across all
+pull-request stages.
+
+Any SST state or GitHub API error aborts planning without removing a stage.
+Reconciliation also refuses plans larger than 20 stages. It does not scan AWS
+resources that are missing from SST state. The action-provided GitHub token is
+available only to the planning step; the action does not pass it to SST or
+application code. A plan over the limit requires manual cleanup before
+scheduled reconciliation can resume.
+
+GitHub state checks and AWS removal cannot be one atomic operation. If a pull
+request reopens after the final check, the shared concurrency queue keeps its
+deployment behind reconciliation so the preview is recreated afterward.
 
 ## SST configuration
 
@@ -102,10 +140,14 @@ export default $config({
     const persistent = persistentStages.has(input.stage);
     const preview = /^pr-[1-9][0-9]*$/.test(input.stage);
 
+    if (!persistent && !preview) {
+      throw new Error(`Unsupported stage: ${input.stage}`);
+    }
+
     return {
       name: "my-app",
-      removal: persistent ? "retain" : "remove",
-      protect: persistent,
+      removal: preview ? "remove" : "retain",
+      protect: !preview,
       state: {
         purge: preview,
       },
@@ -135,7 +177,7 @@ stages.
 | Name                         | Required | Default | Description                                                |
 | ---------------------------- | -------- | ------- | ---------------------------------------------------------- |
 | `working-directory`          | false    | `.`     | Directory containing `sst.config`                          |
-| `operation`                  | false    | `auto`  | `auto`, `deploy`, or `remove`                              |
+| `operation`                  | false    | `auto`  | `auto`, `deploy`, `remove`, or `reconcile`                 |
 | `pr-number`                  | false    |         | PR number for manual workflows                             |
 | `comment-enabled`            | false    | `true`  | Post a preview URL comment after deployment                |
 | `cleanup-on-deploy-failure`  | false    | `true`  | Remove the preview stage after a failed deployment         |
@@ -144,10 +186,12 @@ stages.
 | `verify-removal`             | false    | `auto`  | `auto`, `true`, or `false`                                 |
 | `url-output-key`             | false    | `url`   | Top-level SST output key containing the preview URL        |
 
-With `operation: auto`, a `closed` pull-request event removes the stage and all
-other pull-request actions deploy it. The stage is always derived from
-`pr-number` or `github.event.pull_request.number`; arbitrary stage names are not
-accepted. When both values are present, they must match.
+With `operation: auto`, scheduled events reconcile stages, closed pull-request
+events remove their stage, and other events deploy it. Manual cleanup must pass
+`operation: remove`, as shown above. Deploy and remove stages are always derived
+from `pr-number` or `github.event.pull_request.number`; arbitrary stage names are
+not accepted. When both values are present, they must match. Explicit
+`operation: reconcile` is limited to `schedule` and `workflow_dispatch` events.
 
 `verify-removal: auto` verifies state when the installed SST version supports
 reliable state deletion and falls back with a warning for older versions.
@@ -158,8 +202,8 @@ Use `true` for strict verification with SST 4.13.0 or newer.
 | Name        | Description                                    |
 | ----------- | ---------------------------------------------- |
 | `url`       | Deployed preview URL, when one is available    |
-| `operation` | Resolved `deploy` or `remove` operation        |
-| `stage`     | The `pr-{number}` SST stage used by the action |
+| `operation` | Resolved `deploy`, `remove`, or `reconcile` operation |
+| `stage`     | The `pr-{number}` stage; empty for reconciliation     |
 
 ## Prerequisites
 

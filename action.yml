@@ -11,7 +11,7 @@ inputs:
     required: false
     default: "."
   operation:
-    description: "Operation to run: auto, deploy, or remove"
+    description: "Operation to run: auto, deploy, remove, or reconcile"
     required: false
     default: "auto"
   pr-number:
@@ -19,7 +19,7 @@ inputs:
     required: false
     default: ""
   comment-enabled:
-    description: "Whether to post PR comment (ignored for remove action)"
+    description: "Whether to post PR comment (deploy only)"
     required: false
     default: "true"
   cleanup-on-deploy-failure:
@@ -49,10 +49,10 @@ outputs:
     value: ${{ steps.sst.outputs.url }}
   operation:
     description: "Resolved operation"
-    value: ${{ steps.sst.outputs.operation }}
+    value: ${{ steps.sst.outputs.operation || steps.reconcile_inventory.outputs.operation }}
   stage:
-    description: "SST stage used by the action"
-    value: ${{ steps.sst.outputs.stage }}
+    description: "SST stage used by deploy or remove; empty for reconcile"
+    value: ${{ steps.sst.outputs.stage || steps.reconcile_inventory.outputs.stage }}
 
 runs:
   using: composite
@@ -62,8 +62,25 @@ runs:
       shell: bash
       run: rm -f /usr/local/bin/pulumi*
 
+    - name: Validate reconciliation event
+      if: >-
+        ${{
+          inputs.operation == 'reconcile' &&
+          github.event_name != 'schedule' &&
+          github.event_name != 'workflow_dispatch'
+        }}
+      shell: bash
+      run: |
+        echo "::error::reconcile is supported only for schedule and workflow_dispatch events" >&2
+        exit 1
+
     - name: Run SST
       id: sst
+      if: >-
+        ${{
+          inputs.operation != 'reconcile' &&
+          (inputs.operation != 'auto' || github.event_name != 'schedule')
+        }}
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
@@ -75,8 +92,92 @@ runs:
         INPUT_URL_OUTPUT_KEY: ${{ inputs.url-output-key }}
         INPUT_VERIFY_REMOVAL: ${{ inputs.verify-removal }}
         PR_EVENT_ACTION: ${{ github.event.action }}
+        PR_EVENT_NAME: ${{ github.event_name }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        RECONCILE_GITHUB_TOKEN: ""
       run: '"${{ github.action_path }}/scripts/run-sst.sh"'
+
+    - name: Discover reconciliation candidates
+      id: reconcile_inventory
+      if: >-
+        ${{
+          (
+            github.event_name == 'schedule' ||
+            github.event_name == 'workflow_dispatch'
+          ) &&
+          (
+            inputs.operation == 'reconcile' ||
+            (inputs.operation == 'auto' && github.event_name == 'schedule')
+          )
+        }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ""
+        GITHUB_TOKEN: ""
+        INPUT_CLEANUP_ON_DEPLOY_FAILURE: ${{ inputs.cleanup-on-deploy-failure }}
+        INPUT_OPERATION: ${{ inputs.operation }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+        INPUT_REMOVE_MAX_ATTEMPTS: ${{ inputs.remove-max-attempts }}
+        INPUT_REMOVE_RETRY_DELAY_SECONDS: ${{ inputs.remove-retry-delay-seconds }}
+        INPUT_URL_OUTPUT_KEY: ${{ inputs.url-output-key }}
+        INPUT_VERIFY_REMOVAL: ${{ inputs.verify-removal }}
+        PR_EVENT_ACTION: ${{ github.event.action }}
+        PR_EVENT_NAME: ${{ github.event_name }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        RECONCILE_GITHUB_TOKEN: ""
+      run: '"${{ github.action_path }}/scripts/run-sst.sh"'
+
+    - name: Plan reconciliation
+      id: reconcile
+      if: >-
+        ${{
+          (
+            github.event_name == 'schedule' ||
+            github.event_name == 'workflow_dispatch'
+          ) &&
+          (
+            inputs.operation == 'reconcile' ||
+            (inputs.operation == 'auto' && github.event_name == 'schedule')
+          )
+        }}
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        BASH_ENV: ""
+        GH_TOKEN: ""
+        GITHUB_TOKEN: ""
+        NODE_OPTIONS: ""
+        NODE_PATH: ""
+        RECONCILE_CANDIDATES_FILE: ${{ steps.reconcile_inventory.outputs.reconcile_candidates_file }}
+        RECONCILE_GITHUB_API_URL: ${{ github.api_url }}
+        RECONCILE_GITHUB_REPOSITORY: ${{ github.repository }}
+        RECONCILE_GITHUB_TOKEN: ${{ github.token }}
+      run: 'node "${{ github.action_path }}/scripts/plan-reconciliation.mjs"'
+
+    - name: Remove reconciled stages
+      if: >-
+        ${{
+          (
+            github.event_name == 'schedule' ||
+            github.event_name == 'workflow_dispatch'
+          ) &&
+          (
+            inputs.operation == 'reconcile' ||
+            (inputs.operation == 'auto' && github.event_name == 'schedule')
+          )
+        }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ""
+        GITHUB_TOKEN: ""
+        INPUT_REMOVE_MAX_ATTEMPTS: ${{ inputs.remove-max-attempts }}
+        INPUT_REMOVE_RETRY_DELAY_SECONDS: ${{ inputs.remove-retry-delay-seconds }}
+        INPUT_VERIFY_REMOVAL: ${{ inputs.verify-removal }}
+        RECONCILE_GITHUB_TOKEN: ""
+        RECONCILE_PLAN_FILE: ${{ steps.reconcile.outputs.plan_file }}
+      run: '"${{ github.action_path }}/scripts/remove-reconciled-stages.sh"'
 
     - name: Get short commit sha
       if: steps.sst.outputs.operation == 'deploy' && inputs.comment-enabled == 'true' && github.event_name == 'pull_request'

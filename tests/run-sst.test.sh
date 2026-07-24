@@ -3,6 +3,8 @@
 set -euo pipefail
 
 readonly repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly plan_script="${repository_root}/scripts/plan-reconciliation.mjs"
+readonly remove_reconciled_script="${repository_root}/scripts/remove-reconciled-stages.sh"
 readonly script_under_test="${repository_root}/scripts/run-sst.sh"
 
 fail() {
@@ -32,13 +34,77 @@ run_action() {
     INPUT_URL_OUTPUT_KEY="${INPUT_URL_OUTPUT_KEY-url}" \
     INPUT_VERIFY_REMOVAL="${INPUT_VERIFY_REMOVAL:-auto}" \
     PR_EVENT_ACTION="${PR_EVENT_ACTION:-opened}" \
+    PR_EVENT_NAME="${PR_EVENT_NAME-pull_request}" \
     PR_NUMBER="${PR_NUMBER-123}" \
+    RUNNER_TEMP="$temp_dir" \
     TEST_CALL_LOG="${temp_dir}/calls" \
     TEST_COUNTER_FILE="${temp_dir}/counter" \
+    TEST_DEFAULT_PR_STATE="${TEST_DEFAULT_PR_STATE-}" \
     TEST_OUTPUTS_JSON="${TEST_OUTPUTS_JSON-}" \
+    TEST_PR_STATE_FAILURE_NUMBER="${TEST_PR_STATE_FAILURE_NUMBER-}" \
+    TEST_PR_STATES="${TEST_PR_STATES-}" \
+    TEST_REAL_NODE="$(command -v node)" \
     TEST_STREAM_RELEASE_FILE="${temp_dir}/stream-release" \
     TEST_SCENARIO="$1" \
     bash -c 'cd "$1" && exec bash "$2"' _ "$temp_dir" "$script_under_test"
+}
+
+run_reconcile_action() {
+  local candidates_file
+  local plan_file
+  local scenario="$2"
+  local temp_dir="$1"
+
+  if ! run_action "$temp_dir" "$scenario"; then
+    return 1
+  fi
+
+  candidates_file="$(
+    sed -n 's/^reconcile_candidates_file=//p' "${temp_dir}/github-output"
+  )"
+  if [[ -z "$candidates_file" ]]; then
+    fail "reconciliation did not emit a candidates file"
+  fi
+
+  touch "${temp_dir}/reconcile-output"
+  if ! env \
+    PATH="${temp_dir}/bin:${PATH}" \
+    GITHUB_OUTPUT="${temp_dir}/reconcile-output" \
+    RECONCILE_CANDIDATES_FILE="$candidates_file" \
+    RECONCILE_GITHUB_API_URL="https://api.github.test" \
+    RECONCILE_GITHUB_REPOSITORY="owner/repository" \
+    RECONCILE_GITHUB_TOKEN="test-token" \
+    RUNNER_TEMP="$temp_dir" \
+    TEST_CALL_LOG="${temp_dir}/calls" \
+    TEST_COUNTER_FILE="${temp_dir}/counter" \
+    TEST_DEFAULT_PR_STATE="${TEST_DEFAULT_PR_STATE-}" \
+    TEST_PR_STATE_FAILURE_NUMBER="${TEST_PR_STATE_FAILURE_NUMBER-}" \
+    TEST_PR_STATES="${TEST_PR_STATES-}" \
+    TEST_REAL_NODE="$(command -v node)" \
+    node "$plan_script"; then
+    return 1
+  fi
+
+  plan_file="$(
+    sed -n 's/^plan_file=//p' "${temp_dir}/reconcile-output"
+  )"
+  if [[ -z "$plan_file" ]]; then
+    fail "reconciliation did not emit a plan file"
+  fi
+
+  env \
+    PATH="${temp_dir}/bin:${PATH}" \
+    GITHUB_OUTPUT="${temp_dir}/remove-output" \
+    INPUT_REMOVE_MAX_ATTEMPTS="${INPUT_REMOVE_MAX_ATTEMPTS:-3}" \
+    INPUT_REMOVE_RETRY_DELAY_SECONDS="0" \
+    INPUT_VERIFY_REMOVAL="${INPUT_VERIFY_REMOVAL:-auto}" \
+    RECONCILE_PLAN_FILE="$plan_file" \
+    TEST_CALL_LOG="${temp_dir}/calls" \
+    TEST_COUNTER_FILE="${temp_dir}/counter" \
+    TEST_OUTPUTS_JSON="${TEST_OUTPUTS_JSON-}" \
+    TEST_REAL_NODE="$(command -v node)" \
+    TEST_SCENARIO="$scenario" \
+    bash -c 'cd "$1" && exec bash "$2"' _ "$temp_dir" "$remove_reconciled_script"
 }
 
 make_temp_dir() {
@@ -50,6 +116,18 @@ make_temp_dir() {
   cat >"${temp_dir}/bin/npx" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [[ -n "${RECONCILE_GITHUB_TOKEN:-}" ]]; then
+  echo "GitHub token leaked to npx" >&2
+  exit 98
+fi
+
+if [[ -r "/proc/${PPID}/environ" ]] &&
+  tr '\0' '\n' <"/proc/${PPID}/environ" |
+    grep -Fq 'RECONCILE_GITHUB_TOKEN=test-token'; then
+  echo "GitHub token leaked through the parent process environment" >&2
+  exit 98
+fi
 
 echo "$*" >>"$TEST_CALL_LOG"
 
@@ -77,8 +155,10 @@ case "${TEST_SCENARIO}:$1:$2" in
   deploy-no-url:sst:deploy)
     echo "✓ Complete"
     ;;
-  deploy-failure:sst:remove | deploy-failure:sst:state)
-    echo "Stages: dev"
+  deploy-failure:sst:remove)
+    ;;
+  deploy-failure:sst:state)
+    printf 'Stages: dev\n        %s (not deployed)\n' "$5"
     ;;
   remove-retry:sst:remove)
     count="$(cat "$TEST_COUNTER_FILE" 2>/dev/null || echo 0)"
@@ -89,7 +169,7 @@ case "${TEST_SCENARIO}:$1:$2" in
     fi
     ;;
   remove-retry:sst:state)
-    echo "Stages: dev"
+    printf 'Stages: dev\n        %s (not deployed)\n' "$5"
     ;;
   verify-retry:sst:remove)
     ;;
@@ -100,11 +180,13 @@ case "${TEST_SCENARIO}:$1:$2" in
     if [[ "$count" -eq 1 ]]; then
       printf 'Stages: dev\n            pr-123\n'
     else
-      echo "Stages: dev"
+      printf 'Stages: dev\n        %s (not deployed)\n' "$5"
     fi
     ;;
-  auto-remove:sst:remove | auto-remove:sst:state)
-    echo "Stages: dev"
+  auto-remove:sst:remove)
+    ;;
+  auto-remove:sst:state)
+    printf 'Stages: dev\n        %s (not deployed)\n' "$5"
     ;;
   state-unavailable:sst:remove)
     ;;
@@ -134,6 +216,76 @@ case "${TEST_SCENARIO}:$1:$2" in
   unknown-version:sst:version)
     echo "development build"
     ;;
+  verify-unrecognized:sst:remove)
+    ;;
+  verify-unrecognized:sst:state)
+    echo "state format changed"
+    ;;
+  verify-missing-marker:sst:remove)
+    ;;
+  verify-missing-marker:sst:state)
+    echo "Stages: dev"
+    ;;
+  reconcile-mixed:sst:state)
+    if [[ "$*" == "sst state list --stage pr-1" ]]; then
+      printf 'pr-999\n' >&2
+      printf '\033[90mStages:\033[0m dev\n'
+      printf '            stg\n'
+      printf '            prod\n'
+      printf '            123\n'
+      printf '            -legacy\n'
+      printf '            pr-123\n'
+      printf '            pr-456\n'
+      printf '            pr-prod\n'
+      printf '            pr-0\n'
+      printf '            pr-001\n'
+      printf '            pr-789 (not deployed)\n'
+    else
+      printf 'Stages: dev\n        %s (not deployed)\n' "$5"
+    fi
+    ;;
+  reconcile-mixed:sst:remove)
+    ;;
+  reconcile-state-failure:sst:state)
+    echo "state backend unavailable" >&2
+    exit 1
+    ;;
+  reconcile-remove-failure:sst:state)
+    echo "Stages: pr-456"
+    ;;
+  reconcile-remove-failure:sst:remove)
+    exit 1
+    ;;
+  reconcile-partial-failure:sst:state)
+    if [[ "$*" == "sst state list --stage pr-1" ]]; then
+      printf 'Stages: pr-456\n        pr-789\n        pr-1 (not deployed)\n'
+    else
+      printf 'Stages: dev\n        %s (not deployed)\n' "$5"
+    fi
+    ;;
+  reconcile-partial-failure:sst:remove)
+    if [[ "$4" == "pr-456" ]]; then
+      exit 1
+    fi
+    ;;
+  reconcile-no-stages:sst:state)
+    printf 'Stages: dev\n'
+    printf '        stg\n'
+    printf '        prod\n'
+    printf '        pr-prod\n'
+    printf '        pr-0\n'
+    printf '        pr-001\n'
+    printf '        pr-789 (not deployed)\n'
+    ;;
+  reconcile-limit:sst:state)
+    echo "Stages: pr-1"
+    for number in {2..21}; do
+      printf '        pr-%s\n' "$number"
+    done
+    ;;
+  reconcile-unrecognized-output:sst:state)
+    printf 'Stages:\n- pr-456\n'
+    ;;
   *:sst:version)
     echo "4.17.1"
     ;;
@@ -144,6 +296,62 @@ case "${TEST_SCENARIO}:$1:$2" in
 esac
 EOF
   chmod +x "${temp_dir}/bin/npx"
+
+  cat >"${temp_dir}/bin/node" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1" != */plan-reconciliation.mjs ]]; then
+  exec "$TEST_REAL_NODE" "$@"
+fi
+
+if [[ "${RECONCILE_GITHUB_TOKEN:-}" != "test-token" ]]; then
+  echo "Missing GitHub token in reconciliation planner" >&2
+  exit 1
+fi
+
+plan_file="${TEST_COUNTER_FILE}-plan"
+: >"$plan_file"
+closed_count=0
+
+while IFS= read -r stage; do
+  [[ -n "$stage" ]] || continue
+  pr_number="${stage#pr-}"
+  echo "github pull request ${pr_number}" >>"$TEST_CALL_LOG"
+
+  if [[ "$TEST_PR_STATE_FAILURE_NUMBER" == "$pr_number" ]]; then
+    echo "GitHub API unavailable" >&2
+    exit 1
+  fi
+
+  state=""
+  while IFS="=" read -r candidate_number candidate_state; do
+    if [[ "$candidate_number" == "$pr_number" ]]; then
+      state="$candidate_state"
+      break
+    fi
+  done < <(tr "," "\n" <<<"$TEST_PR_STATES")
+
+  state="${state:-$TEST_DEFAULT_PR_STATE}"
+  if [[ "$state" != "open" && "$state" != "closed" && "$state" != "grace" ]]; then
+    echo "Missing test PR state for ${pr_number}" >&2
+    exit 1
+  fi
+
+  if [[ "$state" == "closed" ]]; then
+    printf '%s\n' "$stage" >>"$plan_file"
+    closed_count="$((closed_count + 1))"
+  fi
+done <"$RECONCILE_CANDIDATES_FILE"
+
+if ((closed_count > 20)); then
+  echo "Too many stages" >&2
+  exit 1
+fi
+
+echo "plan_file=${plan_file}" >>"$GITHUB_OUTPUT"
+EOF
+  chmod +x "${temp_dir}/bin/node"
   echo "$temp_dir"
 }
 
@@ -364,6 +572,32 @@ test_unknown_version_enforces_verification() {
     fail "an unknown SST version did not retry removal"
 }
 
+test_verification_rejects_unrecognized_state_output() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=remove INPUT_VERIFY_REMOVAL=true \
+    run_action "$temp_dir" verify-unrecognized; then
+    fail "verification unexpectedly accepted unrecognized SST state output"
+  fi
+
+  [[ "$(grep -Fc "sst remove --stage pr-123" "${temp_dir}/calls")" -eq 3 ]] ||
+    fail "unrecognized state output did not trigger removal retries"
+}
+
+test_verification_requires_an_explicit_not_deployed_marker() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=remove INPUT_VERIFY_REMOVAL=true \
+    run_action "$temp_dir" verify-missing-marker; then
+    fail "verification unexpectedly succeeded without a not-deployed marker"
+  fi
+
+  [[ "$(grep -Fc "sst remove --stage pr-123" "${temp_dir}/calls")" -eq 3 ]] ||
+    fail "a missing not-deployed marker did not trigger removal retries"
+}
+
 test_invalid_pr_number_is_rejected() {
   local temp_dir
   temp_dir="$(make_temp_dir)"
@@ -433,6 +667,172 @@ test_missing_pr_number_is_rejected() {
   [[ ! -s "${temp_dir}/calls" ]] || fail "npx was called without a PR number"
 }
 
+test_schedule_auto_reconciles_without_a_pr_number() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=auto PR_EVENT_NAME=schedule PR_NUMBER= \
+    run_reconcile_action "$temp_dir" reconcile-no-stages
+
+  assert_contains "${temp_dir}/github-output" "operation=reconcile"
+  assert_contains "${temp_dir}/github-output" "stage="
+  assert_contains "${temp_dir}/calls" "sst state list --stage pr-1"
+}
+
+test_workflow_dispatch_auto_deploys_the_requested_pr() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=auto INPUT_PR_NUMBER=456 PR_EVENT_NAME=workflow_dispatch PR_NUMBER= \
+    run_action "$temp_dir" deploy-success
+
+  assert_contains "${temp_dir}/github-output" "operation=deploy"
+  assert_contains "${temp_dir}/calls" "sst deploy --stage pr-456"
+}
+
+test_reconcile_removes_only_closed_canonical_pr_stages() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=reconcile \
+    PR_NUMBER= \
+    TEST_PR_STATES='123=open,456=closed' \
+    run_reconcile_action "$temp_dir" reconcile-mixed
+
+  assert_contains "${temp_dir}/calls" "github pull request 123"
+  assert_contains "${temp_dir}/calls" "github pull request 456"
+  assert_contains "${temp_dir}/calls" "sst remove --stage pr-456"
+  [[ "$(grep -Fc "sst remove --stage" "${temp_dir}/calls")" -eq 1 ]] ||
+    fail "reconcile removed an unexpected number of stages"
+
+  for unsafe_stage in dev stg prod 123 -legacy pr-prod pr-0 pr-001 pr-789; do
+    if grep -Fq "sst remove --stage ${unsafe_stage}" "${temp_dir}/calls"; then
+      fail "reconcile attempted to remove unsafe stage: ${unsafe_stage}"
+    fi
+  done
+
+  [[ "$(grep -Fc "github pull request 789" "${temp_dir}/calls")" -eq 0 ]] ||
+    fail "not-deployed stage was sent to the GitHub API"
+  [[ "$(grep -Fc "github pull request 999" "${temp_dir}/calls")" -eq 0 ]] ||
+    fail "a stage-like stderr line was sent to the GitHub API"
+}
+
+test_reconcile_api_failure_removes_nothing() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=reconcile \
+    PR_NUMBER= \
+    TEST_PR_STATES='123=closed' \
+    TEST_PR_STATE_FAILURE_NUMBER=456 \
+    run_reconcile_action "$temp_dir" reconcile-mixed; then
+    fail "reconcile unexpectedly ignored a GitHub API failure"
+  fi
+
+  [[ "$(grep -Fc "sst remove --stage" "${temp_dir}/calls")" -eq 0 ]] ||
+    fail "reconcile removed a stage before completing its plan"
+}
+
+test_reconcile_state_failure_never_queries_or_removes() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=reconcile PR_NUMBER= run_reconcile_action "$temp_dir" reconcile-state-failure; then
+    fail "reconcile unexpectedly ignored an SST state failure"
+  fi
+
+  [[ "$(grep -Fc "github pull request" "${temp_dir}/calls")" -eq 0 ]] ||
+    fail "GitHub was queried after SST state listing failed"
+  [[ "$(grep -Fc "sst remove --stage" "${temp_dir}/calls")" -eq 0 ]] ||
+    fail "a stage was removed after SST state listing failed"
+}
+
+test_reconcile_rejects_unrecognized_state_output() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=reconcile PR_NUMBER= \
+    run_reconcile_action "$temp_dir" reconcile-unrecognized-output; then
+    fail "reconcile unexpectedly accepted unrecognized SST state output"
+  fi
+
+  [[ "$(grep -Fc "github pull request" "${temp_dir}/calls")" -eq 0 ]] ||
+    fail "GitHub was queried for unrecognized SST state output"
+  [[ "$(grep -Fc "sst remove --stage" "${temp_dir}/calls")" -eq 0 ]] ||
+    fail "a stage was removed for unrecognized SST state output"
+}
+
+test_reconcile_aggregates_removal_failure() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=reconcile \
+    PR_NUMBER= \
+    TEST_PR_STATES='456=closed' \
+    run_reconcile_action "$temp_dir" reconcile-remove-failure; then
+    fail "reconcile unexpectedly ignored a removal failure"
+  fi
+
+  [[ "$(grep -Fc "sst remove --stage pr-456" "${temp_dir}/calls")" -eq 3 ]] ||
+    fail "reconcile did not apply the configured removal retries"
+}
+
+test_reconcile_continues_after_an_individual_removal_failure() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=reconcile \
+    PR_NUMBER= \
+    TEST_PR_STATES='456=closed,789=closed' \
+    run_reconcile_action "$temp_dir" reconcile-partial-failure; then
+    fail "reconcile unexpectedly ignored an individual removal failure"
+  fi
+
+  [[ "$(grep -Fc "sst remove --stage pr-456" "${temp_dir}/calls")" -eq 3 ]] ||
+    fail "failing stage did not use all removal attempts"
+  [[ "$(grep -Fc "sst remove --stage pr-789" "${temp_dir}/calls")" -eq 1 ]] ||
+    fail "reconcile did not continue to a later stage"
+}
+
+test_reconcile_refuses_an_excessive_removal_plan() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=reconcile \
+    PR_NUMBER= \
+    TEST_DEFAULT_PR_STATE=closed \
+    run_reconcile_action "$temp_dir" reconcile-limit; then
+    fail "reconcile unexpectedly accepted an excessive removal plan"
+  fi
+
+  [[ "$(grep -Fc "sst remove --stage" "${temp_dir}/calls")" -eq 0 ]] ||
+    fail "reconcile started removal before enforcing its safety limit"
+}
+
+test_reconcile_revalidates_the_entire_plan_before_removal() {
+  local plan_file
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+  plan_file="${temp_dir}/unsafe-plan"
+  printf 'pr-456\ndev\n' >"$plan_file"
+
+  if env \
+    PATH="${temp_dir}/bin:${PATH}" \
+    GITHUB_OUTPUT="${temp_dir}/remove-output" \
+    INPUT_REMOVE_RETRY_DELAY_SECONDS=0 \
+    RECONCILE_PLAN_FILE="$plan_file" \
+    TEST_CALL_LOG="${temp_dir}/calls" \
+    TEST_COUNTER_FILE="${temp_dir}/counter" \
+    TEST_REAL_NODE="$(command -v node)" \
+    TEST_SCENARIO=reconcile-mixed \
+    bash -c 'cd "$1" && exec bash "$2"' _ "$temp_dir" "$remove_reconciled_script"; then
+    fail "reconcile unexpectedly accepted an unsafe plan"
+  fi
+
+  [[ "$(grep -Fc "sst remove --stage" "${temp_dir}/calls")" -eq 0 ]] ||
+    fail "reconcile started removal before validating the entire plan"
+}
+
 test_deploy_success
 test_deploy_failure_rolls_back
 test_deploy_output_is_streamed
@@ -450,11 +850,23 @@ test_strict_verification_rejects_unavailable_state
 test_not_deployed_state_is_treated_as_removed
 test_auto_verification_supports_old_state_cleanup
 test_unknown_version_enforces_verification
+test_verification_rejects_unrecognized_state_output
+test_verification_requires_an_explicit_not_deployed_marker
 test_invalid_pr_number_is_rejected
 test_explicit_pr_number_supports_manual_remove
 test_matching_explicit_and_event_pr_numbers_are_allowed
 test_mismatched_explicit_and_event_pr_numbers_are_rejected
 test_noncanonical_pr_numbers_are_rejected
 test_missing_pr_number_is_rejected
+test_schedule_auto_reconciles_without_a_pr_number
+test_workflow_dispatch_auto_deploys_the_requested_pr
+test_reconcile_removes_only_closed_canonical_pr_stages
+test_reconcile_api_failure_removes_nothing
+test_reconcile_state_failure_never_queries_or_removes
+test_reconcile_rejects_unrecognized_state_output
+test_reconcile_aggregates_removal_failure
+test_reconcile_continues_after_an_individual_removal_failure
+test_reconcile_refuses_an_excessive_removal_plan
+test_reconcile_revalidates_the_entire_plan_before_removal
 
 echo "All run-sst tests passed"

@@ -10,7 +10,11 @@ readonly remove_retry_delay_seconds="${INPUT_REMOVE_RETRY_DELAY_SECONDS:-30}"
 readonly url_output_key="${INPUT_URL_OUTPUT_KEY-url}"
 readonly verify_removal="${INPUT_VERIFY_REMOVAL:-auto}"
 readonly event_action="${PR_EVENT_ACTION:-}"
+readonly event_name="${PR_EVENT_NAME:-}"
 readonly event_pr_number="${PR_NUMBER:-}"
+# state list evaluates sst.config for this canonical preview stage, then lists
+# every stage belonging to the resolved app. It does not deploy or remove pr-1.
+readonly reconcile_probe_stage="pr-1"
 readonly script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 error() {
@@ -54,70 +58,161 @@ validate_pr_number() {
   fi
 }
 
-if [[ -n "$input_pr_number" ]]; then
-  validate_pr_number "$input_pr_number" "pr-number"
-fi
-
-if [[ -n "$event_pr_number" ]]; then
-  validate_pr_number "$event_pr_number" "github.event.pull_request.number"
-fi
-
-if [[ -n "$input_pr_number" && -n "$event_pr_number" && "$input_pr_number" != "$event_pr_number" ]]; then
-  error "pr-number does not match github.event.pull_request.number"
-  exit 1
-fi
-
-readonly pr_number="${input_pr_number:-$event_pr_number}"
-if [[ -z "$pr_number" ]]; then
-  error "This action requires pr-number or github.event.pull_request.number"
-  exit 1
-fi
-
+operation=""
 case "$operation_input" in
   auto)
-    if [[ "$event_action" == "closed" ]]; then
-      readonly operation="remove"
-    else
-      readonly operation="deploy"
-    fi
+    case "$event_name" in
+      schedule)
+        operation="reconcile"
+        ;;
+      *)
+        if [[ "$event_action" == "closed" ]]; then
+          operation="remove"
+        else
+          operation="deploy"
+        fi
+        ;;
+    esac
     ;;
-  deploy | remove)
-    readonly operation="$operation_input"
+  deploy | remove | reconcile)
+    operation="$operation_input"
     ;;
   *)
-    error "operation must be auto, deploy, or remove"
+    error "operation must be auto, deploy, remove, or reconcile"
     exit 1
     ;;
 esac
+readonly operation
 
-readonly stage="pr-${pr_number}"
+pr_number=""
+stage=""
+if [[ "$operation" != "reconcile" ]]; then
+  if [[ -n "$input_pr_number" ]]; then
+    validate_pr_number "$input_pr_number" "pr-number"
+  fi
+
+  if [[ -n "$event_pr_number" ]]; then
+    validate_pr_number "$event_pr_number" "github.event.pull_request.number"
+  fi
+
+  if [[ -n "$input_pr_number" && -n "$event_pr_number" && "$input_pr_number" != "$event_pr_number" ]]; then
+    error "pr-number does not match github.event.pull_request.number"
+    exit 1
+  fi
+
+  pr_number="${input_pr_number:-$event_pr_number}"
+  if [[ -z "$pr_number" ]]; then
+    error "This action requires pr-number or github.event.pull_request.number"
+    exit 1
+  fi
+
+  stage="pr-${pr_number}"
+fi
+readonly pr_number
+readonly stage
+
 {
   echo "operation=${operation}"
   echo "stage=${stage}"
 } >>"$GITHUB_OUTPUT"
 
-verify_stage_removed() {
+run_state_list() {
+  local error_file
   local state_list
-  local normalized_state_list
+  local status
+  local target_stage="$1"
 
-  if ! state_list="$(npx sst state list --stage "$stage" 2>&1)"; then
-    printf '%s\n' "$state_list" >&2
-    error "Unable to verify whether ${stage} is still present in SST state"
+  error_file="$(
+    mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sst-preview-state-error.XXXXXX"
+  )"
+  if state_list="$(npx sst state list --stage "$target_stage" 2>"$error_file")"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  if [[ -s "$error_file" ]]; then
+    cat "$error_file" >&2
+  fi
+  rm -f -- "$error_file"
+
+  if ((status != 0)); then
+    return "$status"
+  fi
+
+  printf '%s' "$state_list"
+}
+
+parse_state_entries() {
+  local entry
+  local header_found="false"
+  local line
+  local normalized_state_list
+  local stage_name
+  local state_list="$1"
+
+  normalized_state_list="$(
+    sed -E $'s/\x1b\\[[0-9;?]*[ -\\/]*[@-~]//g' <<<"$state_list"
+  )"
+
+  while IFS= read -r line; do
+    if [[ "$header_found" == "false" ]]; then
+      if [[ ! "$line" =~ ^[[:space:]]*Stages:[[:space:]]*(.*)$ ]]; then
+        continue
+      fi
+      header_found="true"
+      entry="${BASH_REMATCH[1]}"
+    else
+      entry="$line"
+    fi
+
+    if [[ "$entry" =~ ^[[:space:]]*$ ]]; then
+      continue
+    fi
+
+    if [[ ! "$entry" =~ ^[[:space:]]*([A-Za-z0-9-]+)([[:space:]]+\(not[[:space:]]+deployed\))?[[:space:]]*$ ]]; then
+      error "Unable to recognize an entry in the SST Stages section"
+      return 1
+    fi
+
+    stage_name="${BASH_REMATCH[1]}"
+    if [[ -n "${BASH_REMATCH[2]}" ]]; then
+      printf '%s (not deployed)\n' "$stage_name"
+    else
+      printf '%s\n' "$stage_name"
+    fi
+  done <<<"$normalized_state_list"
+
+  if [[ "$header_found" == "false" ]]; then
+    error "Unable to find the SST Stages section"
+    return 1
+  fi
+}
+
+verify_stage_removed() {
+  local target_stage="$1"
+  local state_entries
+  local state_list
+
+  if ! state_list="$(run_state_list "$target_stage")"; then
+    error "Unable to verify whether ${target_stage} is still present in SST state"
     return 2
   fi
 
   printf '%s\n' "$state_list"
-  normalized_state_list="$(
-    sed -E $'s/\x1b\\[[0-9;?]*[ -\\/]*[@-~]//g' <<<"$state_list" |
-      sed -E \
-        -e 's/^[[:space:]]*Stages:[[:space:]]*//' \
-        -e 's/^[[:space:]]+//' \
-        -e 's/[[:space:]]+$//'
-  )"
+  if ! state_entries="$(parse_state_entries "$state_list")"; then
+    error "Unable to recognize the SST state list output while verifying ${target_stage}"
+    return 2
+  fi
 
-  if grep -Fqx -- "$stage" <<<"$normalized_state_list"; then
-    error "${stage} is still present in SST state"
+  if grep -Fqx -- "$target_stage" <<<"$state_entries"; then
+    error "${target_stage} is still present in SST state"
     return 1
+  fi
+
+  if ! grep -Fqx -- "${target_stage} (not deployed)" <<<"$state_entries"; then
+    error "SST did not confirm that ${target_stage} is no longer deployed"
+    return 2
   fi
 }
 
@@ -147,9 +242,15 @@ sst_supports_state_removal() {
 }
 
 remove_stage() {
+  local target_stage="$1"
   local attempt
   local state_removal_support
   local verification_mode="$verify_removal"
+
+  if [[ ! "$target_stage" =~ ^pr-[1-9][0-9]*$ ]]; then
+    error "Refusing to remove noncanonical stage: ${target_stage}"
+    return 1
+  fi
 
   if [[ "$verification_mode" == "auto" ]]; then
     if sst_supports_state_removal; then
@@ -167,14 +268,14 @@ remove_stage() {
   fi
 
   for ((attempt = 1; attempt <= remove_max_attempts; attempt++)); do
-    echo "Removing ${stage} (attempt ${attempt}/${remove_max_attempts})"
+    echo "Removing ${target_stage} (attempt ${attempt}/${remove_max_attempts})"
 
-    if npx sst remove --stage "$stage"; then
+    if npx sst remove --stage "$target_stage"; then
       if [[ "$verification_mode" == "false" ]]; then
         return 0
       fi
 
-      if verify_stage_removed; then
+      if verify_stage_removed "$target_stage"; then
         return 0
       fi
     fi
@@ -184,12 +285,50 @@ remove_stage() {
     fi
   done
 
-  error "Failed to remove ${stage} after ${remove_max_attempts} attempts"
+  error "Failed to remove ${target_stage} after ${remove_max_attempts} attempts"
   return 1
 }
 
+discover_reconcile_stages() {
+  local candidates_file
+  local preview_stages
+  local state_entries
+  local state_list
+
+  if ! state_list="$(run_state_list "$reconcile_probe_stage")"; then
+    error "Unable to list SST stages for reconciliation"
+    return 1
+  fi
+
+  printf '%s\n' "$state_list"
+  if ! state_entries="$(parse_state_entries "$state_list")"; then
+    error "Unable to recognize the SST state list output; no stages were removed"
+    return 1
+  fi
+
+  preview_stages="$(
+    sed -E -n -e '/^pr-[1-9][0-9]*$/p' <<<"$state_entries" |
+      LC_ALL=C sort -u
+  )"
+
+  candidates_file="$(
+    mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sst-preview-candidates.XXXXXX"
+  )"
+  printf '%s\n' "$preview_stages" >"$candidates_file"
+  echo "reconcile_candidates_file=${candidates_file}" >>"$GITHUB_OUTPUT"
+
+  if [[ -z "$preview_stages" ]]; then
+    echo "No deployed pull-request stages found"
+  fi
+}
+
+if [[ "$operation" == "reconcile" ]]; then
+  discover_reconcile_stages
+  exit 0
+fi
+
 if [[ "$operation" == "remove" ]]; then
-  remove_stage
+  remove_stage "$stage"
   exit 0
 fi
 
@@ -212,7 +351,7 @@ if ((deploy_status != 0)); then
 
   if [[ "$cleanup_on_deploy_failure" == "true" ]]; then
     echo "Deploy failed; removing partially created resources for ${stage}"
-    if ! remove_stage; then
+    if ! remove_stage "$stage"; then
       error "Deploy and rollback both failed for ${stage}"
     fi
   fi
