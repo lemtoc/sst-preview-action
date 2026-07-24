@@ -3,12 +3,13 @@
 set -euo pipefail
 
 readonly operation_input="${INPUT_OPERATION:-auto}"
+readonly input_pr_number="${INPUT_PR_NUMBER:-}"
 readonly cleanup_on_deploy_failure="${INPUT_CLEANUP_ON_DEPLOY_FAILURE:-true}"
 readonly remove_max_attempts="${INPUT_REMOVE_MAX_ATTEMPTS:-3}"
 readonly remove_retry_delay_seconds="${INPUT_REMOVE_RETRY_DELAY_SECONDS:-30}"
 readonly verify_removal="${INPUT_VERIFY_REMOVAL:-auto}"
 readonly event_action="${PR_EVENT_ACTION:-}"
-readonly pr_number="${PR_NUMBER:-}"
+readonly event_pr_number="${PR_NUMBER:-}"
 
 error() {
   echo "::error::$*" >&2
@@ -41,8 +42,32 @@ if [[ ! "$remove_retry_delay_seconds" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-if [[ ! "$pr_number" =~ ^[0-9]+$ ]]; then
-  error "This action requires github.event.pull_request.number"
+validate_pr_number() {
+  local value="$1"
+  local source="$2"
+
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    error "${source} must be a positive integer without leading zeros"
+    exit 1
+  fi
+}
+
+if [[ -n "$input_pr_number" ]]; then
+  validate_pr_number "$input_pr_number" "pr-number"
+fi
+
+if [[ -n "$event_pr_number" ]]; then
+  validate_pr_number "$event_pr_number" "github.event.pull_request.number"
+fi
+
+if [[ -n "$input_pr_number" && -n "$event_pr_number" && "$input_pr_number" != "$event_pr_number" ]]; then
+  error "pr-number does not match github.event.pull_request.number"
+  exit 1
+fi
+
+readonly pr_number="${input_pr_number:-$event_pr_number}"
+if [[ -z "$pr_number" ]]; then
+  error "This action requires pr-number or github.event.pull_request.number"
   exit 1
 fi
 

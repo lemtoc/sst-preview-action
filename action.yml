@@ -14,6 +14,10 @@ inputs:
     description: "Operation to run: auto, deploy, or remove"
     required: false
     default: "auto"
+  pr-number:
+    description: "Pull request number for manual workflows"
+    required: false
+    default: ""
   comment-enabled:
     description: "Whether to post PR comment (ignored for remove action)"
     required: false
@@ -61,6 +65,7 @@ runs:
       env:
         INPUT_CLEANUP_ON_DEPLOY_FAILURE: ${{ inputs.cleanup-on-deploy-failure }}
         INPUT_OPERATION: ${{ inputs.operation }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
         INPUT_REMOVE_MAX_ATTEMPTS: ${{ inputs.remove-max-attempts }}
         INPUT_REMOVE_RETRY_DELAY_SECONDS: ${{ inputs.remove-retry-delay-seconds }}
         INPUT_VERIFY_REMOVAL: ${{ inputs.verify-removal }}

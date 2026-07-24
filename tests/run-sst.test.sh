@@ -26,11 +26,12 @@ run_action() {
     GITHUB_OUTPUT="${temp_dir}/github-output" \
     INPUT_CLEANUP_ON_DEPLOY_FAILURE="${INPUT_CLEANUP_ON_DEPLOY_FAILURE:-true}" \
     INPUT_OPERATION="${INPUT_OPERATION:-auto}" \
+    INPUT_PR_NUMBER="${INPUT_PR_NUMBER-}" \
     INPUT_REMOVE_MAX_ATTEMPTS="${INPUT_REMOVE_MAX_ATTEMPTS:-3}" \
     INPUT_REMOVE_RETRY_DELAY_SECONDS="0" \
     INPUT_VERIFY_REMOVAL="${INPUT_VERIFY_REMOVAL:-auto}" \
     PR_EVENT_ACTION="${PR_EVENT_ACTION:-opened}" \
-    PR_NUMBER="${PR_NUMBER:-123}" \
+    PR_NUMBER="${PR_NUMBER-123}" \
     TEST_CALL_LOG="${temp_dir}/calls" \
     TEST_COUNTER_FILE="${temp_dir}/counter" \
     TEST_SCENARIO="$1" \
@@ -252,6 +253,64 @@ test_invalid_pr_number_is_rejected() {
   [[ ! -s "${temp_dir}/calls" ]] || fail "npx was called for an invalid PR number"
 }
 
+test_explicit_pr_number_supports_manual_remove() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=remove INPUT_PR_NUMBER=456 PR_NUMBER= run_action "$temp_dir" auto-remove
+
+  assert_contains "${temp_dir}/github-output" "stage=pr-456"
+  assert_contains "${temp_dir}/calls" "sst remove --stage pr-456"
+}
+
+test_matching_explicit_and_event_pr_numbers_are_allowed() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=remove INPUT_PR_NUMBER=123 PR_NUMBER=123 run_action "$temp_dir" auto-remove
+
+  assert_contains "${temp_dir}/github-output" "stage=pr-123"
+  assert_contains "${temp_dir}/calls" "sst remove --stage pr-123"
+}
+
+test_mismatched_explicit_and_event_pr_numbers_are_rejected() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=remove INPUT_PR_NUMBER=456 PR_NUMBER=123 run_action "$temp_dir" auto-remove; then
+    fail "mismatched PR numbers unexpectedly succeeded"
+  fi
+
+  [[ ! -s "${temp_dir}/calls" ]] || fail "npx was called for mismatched PR numbers"
+}
+
+test_noncanonical_pr_numbers_are_rejected() {
+  local invalid_pr_number
+
+  for invalid_pr_number in 0 001 '123;echo unsafe'; do
+    local temp_dir
+    temp_dir="$(make_temp_dir)"
+
+    if INPUT_OPERATION=remove INPUT_PR_NUMBER="$invalid_pr_number" PR_NUMBER= run_action "$temp_dir" auto-remove; then
+      fail "invalid explicit PR number unexpectedly succeeded: ${invalid_pr_number}"
+    fi
+
+    [[ ! -s "${temp_dir}/calls" ]] ||
+      fail "npx was called for invalid explicit PR number: ${invalid_pr_number}"
+  done
+}
+
+test_missing_pr_number_is_rejected() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=remove INPUT_PR_NUMBER= PR_NUMBER= run_action "$temp_dir" auto-remove; then
+    fail "missing PR number unexpectedly succeeded"
+  fi
+
+  [[ ! -s "${temp_dir}/calls" ]] || fail "npx was called without a PR number"
+}
+
 test_deploy_success
 test_deploy_failure_rolls_back
 test_remove_retries
@@ -263,5 +322,10 @@ test_not_deployed_state_is_treated_as_removed
 test_auto_verification_supports_old_state_cleanup
 test_unknown_version_enforces_verification
 test_invalid_pr_number_is_rejected
+test_explicit_pr_number_supports_manual_remove
+test_matching_explicit_and_event_pr_numbers_are_allowed
+test_mismatched_explicit_and_event_pr_numbers_are_rejected
+test_noncanonical_pr_numbers_are_rejected
+test_missing_pr_number_is_rejected
 
 echo "All run-sst tests passed"
