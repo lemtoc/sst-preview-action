@@ -244,6 +244,7 @@ sst_supports_state_removal() {
 remove_stage() {
   local target_stage="$1"
   local attempt
+  local remove_succeeded
   local state_removal_support
   local verification_mode="$verify_removal"
 
@@ -271,13 +272,20 @@ remove_stage() {
     echo "Removing ${target_stage} (attempt ${attempt}/${remove_max_attempts})"
 
     if npx sst remove --stage "$target_stage"; then
-      if [[ "$verification_mode" == "false" ]]; then
-        return 0
-      fi
+      remove_succeeded="true"
+    else
+      remove_succeeded="false"
+    fi
 
-      if verify_stage_removed "$target_stage"; then
-        return 0
+    if [[ "$remove_succeeded" == "true" && "$verification_mode" == "false" ]]; then
+      return 0
+    fi
+
+    if verify_stage_removed "$target_stage"; then
+      if [[ "$remove_succeeded" == "false" ]]; then
+        echo "::notice::${target_stage} is already absent from SST state"
       fi
+      return 0
     fi
 
     if ((attempt < remove_max_attempts)); then

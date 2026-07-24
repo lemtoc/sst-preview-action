@@ -237,6 +237,9 @@ event pull request numbers are present, they must match. Explicit
 `verify-removal: auto` verifies state when the installed SST version supports
 reliable state deletion and falls back with a warning for older versions.
 Use `true` for strict verification with SST 4.13.0 or newer.
+`false` skips verification only after a successful `sst remove`; a failed
+remove is still state-checked so an already absent stage succeeds without
+masking an unverified removal failure.
 
 ## Outputs
 

@@ -169,7 +169,27 @@ case "${TEST_SCENARIO}:$1:$2" in
     fi
     ;;
   remove-retry:sst:state)
+    count="$(cat "$TEST_COUNTER_FILE" 2>/dev/null || echo 0)"
+    if [[ "$count" -eq 1 ]]; then
+      printf 'Stages: dev\n        %s\n' "$5"
+    else
+      printf 'Stages: dev\n        %s (not deployed)\n' "$5"
+    fi
+    ;;
+  stage-not-found:sst:remove)
+    echo "Stage not found" >&2
+    exit 1
+    ;;
+  stage-not-found:sst:state)
     printf 'Stages: dev\n        %s (not deployed)\n' "$5"
+    ;;
+  remove-and-state-failure:sst:remove)
+    echo "remove unavailable" >&2
+    exit 1
+    ;;
+  remove-and-state-failure:sst:state)
+    echo "state unavailable" >&2
+    exit 1
     ;;
   verify-retry:sst:remove)
     ;;
@@ -256,9 +276,22 @@ case "${TEST_SCENARIO}:$1:$2" in
   reconcile-remove-failure:sst:remove)
     exit 1
     ;;
+  reconcile-stage-already-removed:sst:state)
+    if [[ "$*" == "sst state list --stage pr-1" ]]; then
+      printf 'Stages: pr-456\n        pr-1 (not deployed)\n'
+    else
+      printf 'Stages: dev\n        %s (not deployed)\n' "$5"
+    fi
+    ;;
+  reconcile-stage-already-removed:sst:remove)
+    echo "Stage not found" >&2
+    exit 1
+    ;;
   reconcile-partial-failure:sst:state)
     if [[ "$*" == "sst state list --stage pr-1" ]]; then
       printf 'Stages: pr-456\n        pr-789\n        pr-1 (not deployed)\n'
+    elif [[ "$5" == "pr-456" ]]; then
+      printf 'Stages: dev\n        pr-456\n'
     else
       printf 'Stages: dev\n        %s (not deployed)\n' "$5"
     fi
@@ -562,6 +595,57 @@ test_not_deployed_state_is_treated_as_removed() {
   assert_contains "${temp_dir}/calls" "sst state list --stage pr-123"
 }
 
+test_missing_stage_is_treated_as_removed() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=auto PR_EVENT_ACTION=closed run_action "$temp_dir" stage-not-found
+
+  [[ "$(grep -Fc "sst remove --stage pr-123" "${temp_dir}/calls")" -eq 1 ]] ||
+    fail "remove was retried for an already missing stage"
+  assert_contains "${temp_dir}/calls" "sst state list --stage pr-123"
+}
+
+test_missing_stage_is_verified_when_verification_is_disabled() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=remove INPUT_VERIFY_REMOVAL=false \
+    run_action "$temp_dir" stage-not-found
+
+  [[ "$(grep -Fc "sst remove --stage pr-123" "${temp_dir}/calls")" -eq 1 ]] ||
+    fail "remove was retried for a verified missing stage"
+  assert_contains "${temp_dir}/calls" "sst state list --stage pr-123"
+}
+
+test_disabled_verification_skips_state_after_successful_remove() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=remove INPUT_VERIFY_REMOVAL=false \
+    run_action "$temp_dir" auto-remove
+
+  [[ "$(grep -Fc "sst remove --stage pr-123" "${temp_dir}/calls")" -eq 1 ]] ||
+    fail "successful remove was retried with verification disabled"
+  [[ "$(grep -Fc "sst state list --stage pr-123" "${temp_dir}/calls")" -eq 0 ]] ||
+    fail "successful remove was verified despite verification being disabled"
+}
+
+test_disabled_verification_does_not_mask_unverified_remove_failure() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  if INPUT_OPERATION=remove INPUT_VERIFY_REMOVAL=false \
+    run_action "$temp_dir" remove-and-state-failure; then
+    fail "unverified remove failure unexpectedly succeeded"
+  fi
+
+  [[ "$(grep -Fc "sst remove --stage pr-123" "${temp_dir}/calls")" -eq 3 ]] ||
+    fail "unverified remove failure did not use all attempts"
+  [[ "$(grep -Fc "sst state list --stage pr-123" "${temp_dir}/calls")" -eq 3 ]] ||
+    fail "failed remove was not state-checked on every attempt"
+}
+
 test_auto_verification_supports_old_state_cleanup() {
   local temp_dir
   temp_dir="$(make_temp_dir)"
@@ -790,6 +874,20 @@ test_reconcile_aggregates_removal_failure() {
     fail "reconcile did not apply the configured removal retries"
 }
 
+test_reconcile_accepts_a_stage_removed_after_planning() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=reconcile \
+    PR_NUMBER= \
+    TEST_PR_STATES='456=closed' \
+    run_reconcile_action "$temp_dir" reconcile-stage-already-removed
+
+  [[ "$(grep -Fc "sst remove --stage pr-456" "${temp_dir}/calls")" -eq 1 ]] ||
+    fail "reconcile retried a stage that was already removed"
+  assert_contains "${temp_dir}/calls" "sst state list --stage pr-456"
+}
+
 test_reconcile_continues_after_an_individual_removal_failure() {
   local temp_dir
   temp_dir="$(make_temp_dir)"
@@ -862,6 +960,10 @@ test_auto_closed_event_removes
 test_auto_verification_rejects_unavailable_state_on_modern_sst
 test_strict_verification_rejects_unavailable_state
 test_not_deployed_state_is_treated_as_removed
+test_missing_stage_is_treated_as_removed
+test_missing_stage_is_verified_when_verification_is_disabled
+test_disabled_verification_skips_state_after_successful_remove
+test_disabled_verification_does_not_mask_unverified_remove_failure
 test_auto_verification_supports_old_state_cleanup
 test_unknown_version_enforces_verification
 test_verification_rejects_unrecognized_state_output
@@ -879,6 +981,7 @@ test_reconcile_api_failure_removes_nothing
 test_reconcile_state_failure_never_queries_or_removes
 test_reconcile_rejects_unrecognized_state_output
 test_reconcile_aggregates_removal_failure
+test_reconcile_accepts_a_stage_removed_after_planning
 test_reconcile_continues_after_an_individual_removal_failure
 test_reconcile_refuses_an_excessive_removal_plan
 test_reconcile_revalidates_the_entire_plan_before_removal
