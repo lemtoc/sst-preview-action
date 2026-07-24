@@ -15,7 +15,11 @@ inputs:
     required: false
     default: "auto"
   pr-number:
-    description: "Pull request number for manual workflows"
+    description: "Optional pull request number for manual disambiguation or default-branch cleanup"
+    required: false
+    default: ""
+  target-branch:
+    description: "Pull request branch to resolve for manual cleanup"
     required: false
     default: ""
   comment-enabled:
@@ -49,9 +53,9 @@ outputs:
     value: ${{ steps.sst.outputs.url }}
   operation:
     description: "Resolved operation"
-    value: ${{ steps.sst.outputs.operation || steps.reconcile_inventory.outputs.operation }}
+    value: ${{ steps.sst.outputs.operation || steps.dispatch_pr.outputs.operation || steps.reconcile_inventory.outputs.operation }}
   stage:
-    description: "SST stage used by deploy or remove; empty for reconcile"
+    description: "SST stage acted on; empty for reconcile or a skipped deploy"
     value: ${{ steps.sst.outputs.stage || steps.reconcile_inventory.outputs.stage }}
 
 runs:
@@ -74,19 +78,69 @@ runs:
         echo "::error::reconcile is supported only for schedule and workflow_dispatch events" >&2
         exit 1
 
+    - name: Validate trusted dispatch ref
+      if: >-
+        ${{
+          github.event_name == 'workflow_dispatch' &&
+          (
+            inputs.operation == 'remove' ||
+            inputs.operation == 'reconcile'
+          ) &&
+          (
+            github.ref_type != 'branch' ||
+            github.ref_name != github.event.repository.default_branch
+          )
+        }}
+      shell: bash
+      run: |
+        echo "::error::manual remove and reconcile must run from the default branch" >&2
+        exit 1
+
+    - name: Resolve dispatch pull request
+      id: dispatch_pr
+      if: >-
+        ${{
+          github.event_name == 'workflow_dispatch' &&
+          (
+            inputs.operation == 'auto' ||
+            inputs.operation == 'deploy' ||
+            inputs.operation == 'remove'
+          )
+        }}
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        BASH_ENV: ""
+        DISPATCH_GITHUB_API_URL: ${{ github.api_url }}
+        DISPATCH_GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        DISPATCH_GITHUB_REF_NAME: ${{ github.ref_name }}
+        DISPATCH_GITHUB_REF_TYPE: ${{ github.ref_type }}
+        DISPATCH_GITHUB_REPOSITORY: ${{ github.repository }}
+        DISPATCH_GITHUB_TOKEN: ${{ github.token }}
+        DISPATCH_INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+        DISPATCH_OPERATION: ${{ inputs.operation }}
+        DISPATCH_TARGET_BRANCH: ${{ inputs.target-branch }}
+        GH_TOKEN: ""
+        GITHUB_TOKEN: ""
+        NODE_OPTIONS: ""
+        NODE_PATH: ""
+      run: 'node "${{ github.action_path }}/scripts/resolve-dispatch-pull-request.mjs"'
+
     - name: Run SST
       id: sst
       if: >-
         ${{
           inputs.operation != 'reconcile' &&
-          (inputs.operation != 'auto' || github.event_name != 'schedule')
+          (inputs.operation != 'auto' || github.event_name != 'schedule') &&
+          steps.dispatch_pr.outputs.skip != 'true'
         }}
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
+        DISPATCH_GITHUB_TOKEN: ""
         INPUT_CLEANUP_ON_DEPLOY_FAILURE: ${{ inputs.cleanup-on-deploy-failure }}
         INPUT_OPERATION: ${{ inputs.operation }}
-        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+        INPUT_PR_NUMBER: ${{ steps.dispatch_pr.outputs.pr_number || inputs.pr-number }}
         INPUT_REMOVE_MAX_ATTEMPTS: ${{ inputs.remove-max-attempts }}
         INPUT_REMOVE_RETRY_DELAY_SECONDS: ${{ inputs.remove-retry-delay-seconds }}
         INPUT_URL_OUTPUT_KEY: ${{ inputs.url-output-key }}
@@ -113,6 +167,7 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
+        DISPATCH_GITHUB_TOKEN: ""
         GH_TOKEN: ""
         GITHUB_TOKEN: ""
         INPUT_CLEANUP_ON_DEPLOY_FAILURE: ${{ inputs.cleanup-on-deploy-failure }}
@@ -170,6 +225,7 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
+        DISPATCH_GITHUB_TOKEN: ""
         GH_TOKEN: ""
         GITHUB_TOKEN: ""
         INPUT_REMOVE_MAX_ATTEMPTS: ${{ inputs.remove-max-attempts }}

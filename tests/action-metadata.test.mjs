@@ -16,11 +16,21 @@ const stepBlock = (name) => {
   return match.groups.body;
 };
 
-test("exposes github.token only to the reconciliation planner", () => {
+test("exposes github.token only to isolated GitHub API steps", () => {
   assert.equal(
     action.match(/\$\{\{ github\.token \}\}/gu)?.length,
-    1,
+    2,
   );
+
+  const resolver = stepBlock("Resolve dispatch pull request");
+  assert.match(
+    resolver,
+    /DISPATCH_GITHUB_TOKEN: \$\{\{ github\.token \}\}/u,
+  );
+  assert.match(resolver, /working-directory: \$\{\{ github\.action_path \}\}/u);
+  assert.match(resolver, /BASH_ENV: ""/u);
+  assert.match(resolver, /NODE_OPTIONS: ""/u);
+  assert.doesNotMatch(resolver, /run-sst|remove-reconciled|npx sst/u);
 
   const planner = stepBlock("Plan reconciliation");
   assert.match(planner, /RECONCILE_GITHUB_TOKEN: \$\{\{ github\.token \}\}/u);
@@ -30,7 +40,17 @@ test("exposes github.token only to the reconciliation planner", () => {
   assert.doesNotMatch(planner, /run-sst|remove-reconciled|npx sst/u);
 });
 
-test("keeps tokens out of both SST-bearing reconciliation steps", () => {
+test("keeps action-provided tokens out of every SST-bearing step", () => {
+  for (const name of [
+    "Run SST",
+    "Discover reconciliation candidates",
+    "Remove reconciled stages",
+  ]) {
+    const step = stepBlock(name);
+    assert.match(step, /DISPATCH_GITHUB_TOKEN: ""/u);
+    assert.match(step, /RECONCILE_GITHUB_TOKEN: ""/u);
+  }
+
   for (const name of [
     "Discover reconciliation candidates",
     "Remove reconciled stages",
@@ -38,7 +58,6 @@ test("keeps tokens out of both SST-bearing reconciliation steps", () => {
     const step = stepBlock(name);
     assert.match(step, /GH_TOKEN: ""/u);
     assert.match(step, /GITHUB_TOKEN: ""/u);
-    assert.match(step, /RECONCILE_GITHUB_TOKEN: ""/u);
   }
 });
 
@@ -53,4 +72,42 @@ test("gates token-bearing steps with trusted inputs and event context", () => {
     assert.match(step, /github\.event_name == 'workflow_dispatch'/u);
     assert.doesNotMatch(step, /steps\.[^.]+\.outputs\.operation/u);
   }
+});
+
+test("resolves every manual deploy or remove run before invoking SST", () => {
+  const resolver = stepBlock("Resolve dispatch pull request");
+
+  assert.match(resolver, /github\.event_name == 'workflow_dispatch'/u);
+  assert.match(resolver, /inputs\.operation == 'auto'/u);
+  assert.match(resolver, /inputs\.operation == 'deploy'/u);
+  assert.match(resolver, /inputs\.operation == 'remove'/u);
+  assert.match(
+    resolver,
+    /DISPATCH_INPUT_PR_NUMBER: \$\{\{ inputs\.pr-number \}\}/u,
+  );
+  assert.match(
+    resolver,
+    /DISPATCH_TARGET_BRANCH: \$\{\{ inputs\.target-branch \}\}/u,
+  );
+  assert.doesNotMatch(resolver, /steps\.[^.]+\.outputs/u);
+
+  const runSst = stepBlock("Run SST");
+  assert.match(runSst, /steps\.dispatch_pr\.outputs\.skip != 'true'/u);
+  assert.match(
+    runSst,
+    /INPUT_PR_NUMBER: \$\{\{ steps\.dispatch_pr\.outputs\.pr_number \|\| inputs\.pr-number \}\}/u,
+  );
+});
+
+test("requires the trusted default branch for manual cleanup", () => {
+  const validation = stepBlock("Validate trusted dispatch ref");
+
+  assert.match(validation, /github\.event_name == 'workflow_dispatch'/u);
+  assert.match(validation, /inputs\.operation == 'remove'/u);
+  assert.match(validation, /inputs\.operation == 'reconcile'/u);
+  assert.match(validation, /github\.ref_type != 'branch'/u);
+  assert.match(
+    validation,
+    /github\.ref_name != github\.event\.repository\.default_branch/u,
+  );
 });
