@@ -419,7 +419,7 @@ test_named_output_url_is_preferred() {
     TEST_OUTPUTS_JSON='{"url":"https://preview.example.com"}' \
     run_action "$temp_dir" deploy-named-output
 
-  assert_contains "${temp_dir}/github-output" "url=https://preview.example.com"
+  assert_contains "${temp_dir}/github-output" "url=https://preview.example.com/"
 }
 
 test_custom_named_output_key_is_supported() {
@@ -431,7 +431,20 @@ test_custom_named_output_key_is_supported() {
     TEST_OUTPUTS_JSON='{"previewUrl":"https://custom.example.com"}' \
     run_action "$temp_dir" deploy-named-output
 
-  assert_contains "${temp_dir}/github-output" "url=https://custom.example.com"
+  assert_contains "${temp_dir}/github-output" "url=https://custom.example.com/"
+}
+
+test_named_output_url_is_normalized_before_use() {
+  local temp_dir
+  temp_dir="$(make_temp_dir)"
+
+  INPUT_OPERATION=deploy \
+    TEST_OUTPUTS_JSON='{"url":"https://preview.example.com/\" onclick=\"alert(1)"}' \
+    run_action "$temp_dir" deploy-named-output
+
+  assert_contains \
+    "${temp_dir}/github-output" \
+    "url=https://preview.example.com/%22%20onclick=%22alert(1)"
 }
 
 test_missing_named_output_falls_back_to_deploy_log() {
@@ -838,6 +851,7 @@ test_deploy_failure_rolls_back
 test_deploy_output_is_streamed
 test_named_output_url_is_preferred
 test_custom_named_output_key_is_supported
+test_named_output_url_is_normalized_before_use
 test_missing_named_output_falls_back_to_deploy_log
 test_invalid_named_output_cannot_inject_action_outputs
 test_malformed_outputs_file_falls_back_to_deploy_log

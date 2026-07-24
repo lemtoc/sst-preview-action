@@ -21,7 +21,7 @@ try {
     process.exit(1);
   }
 
-  process.stdout.write(value);
+  process.stdout.write(url.href);
 } catch {
   process.exit(1);
 }
